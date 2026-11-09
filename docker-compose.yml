@@ -1,0 +1,12 @@
+services:
+  planner:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - planner-data:/data
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  planner-data:
