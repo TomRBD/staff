@@ -13,18 +13,21 @@ export default async function availability(app) {
     return mondayOf(w);
   };
 
-  function slotsOf(memberId, dates) {
-    return db
-      .prepare('SELECT date, hour FROM availability WHERE member_id = ? AND date BETWEEN ? AND ? ORDER BY date, hour')
-      .all(memberId, dates[0], dates[6])
-      .map((r) => `${r.date}|${r.hour}`);
+  async function slotsOf(memberId, dates) {
+    const rows = await db.all(
+      'SELECT date, hour FROM availability WHERE member_id = ? AND date BETWEEN ? AND ? ORDER BY date, hour',
+      memberId, dates[0], dates[6]
+    );
+    return rows.map((r) => `${r.date}|${r.hour}`);
   }
 
-  const replaceWeek = db.transaction((memberId, dates, slots) => {
-    db.prepare('DELETE FROM availability WHERE member_id = ? AND date BETWEEN ? AND ?').run(memberId, dates[0], dates[6]);
-    const ins = db.prepare('INSERT OR IGNORE INTO availability (member_id, date, hour) VALUES (?, ?, ?)');
-    for (const [date, hour] of slots) ins.run(memberId, date, hour);
-  });
+  // Remplacement atomique de la semaine en un seul aller-retour
+  function replaceWeek(memberId, dates, slots) {
+    return db.batch([
+      ['DELETE FROM availability WHERE member_id = ? AND date BETWEEN ? AND ?', memberId, dates[0], dates[6]],
+      ...slots.map(([date, hour]) => ['INSERT OR IGNORE INTO availability (member_id, date, hour) VALUES (?, ?, ?)', memberId, date, hour]),
+    ]);
+  }
 
   // Disponibilités de toute l'équipe pour une semaine
   app.get('/availability', {
@@ -33,10 +36,10 @@ export default async function availability(app) {
   }, async (req) => {
     const monday = parseWeek(req.query.week);
     const dates = weekDates(monday);
-    const members = db.prepare('SELECT * FROM members WHERE active = 1 ORDER BY pseudo COLLATE NOCASE').all();
-    const rows = db
-      .prepare('SELECT member_id, date, hour FROM availability WHERE date BETWEEN ? AND ?')
-      .all(dates[0], dates[6]);
+    const [members, rows] = await Promise.all([
+      db.all('SELECT * FROM members WHERE active = 1 ORDER BY pseudo COLLATE NOCASE'),
+      db.all('SELECT member_id, date, hour FROM availability WHERE date BETWEEN ? AND ?', dates[0], dates[6]),
+    ]);
     const slots = {};
     for (const r of rows) (slots[r.member_id] ??= []).push(`${r.date}|${r.hour}`);
     return { week: monday, dates, members: members.map(publicMember), slots };
@@ -67,8 +70,8 @@ export default async function availability(app) {
       }
       return [date, hour];
     });
-    replaceWeek(req.member.id, dates, parsed);
-    return { slots: slotsOf(req.member.id, dates) };
+    await replaceWeek(req.member.id, dates, parsed);
+    return { slots: await slotsOf(req.member.id, dates) };
   });
 
   // Copie mes dispos de la semaine précédente
@@ -78,11 +81,11 @@ export default async function availability(app) {
   }, async (req) => {
     const dates = weekDates(parseWeek(req.body.week));
     const prev = weekDates(addDays(dates[0], -7));
-    const shifted = slotsOf(req.member.id, prev).map((s) => {
+    const shifted = (await slotsOf(req.member.id, prev)).map((s) => {
       const [, date, h] = SLOT_RE.exec(s);
       return [addDays(date, 7), Number(h)];
     });
-    replaceWeek(req.member.id, dates, shifted);
-    return { slots: slotsOf(req.member.id, dates) };
+    await replaceWeek(req.member.id, dates, shifted);
+    return { slots: await slotsOf(req.member.id, dates) };
   });
 }

@@ -3,15 +3,15 @@ import { bus } from '../lib/bus.js';
 import { fmtDateFr, fmtTime } from '../lib/dates.js';
 
 // Notifications Discord via webhook. Inactif si DISCORD_WEBHOOK_URL est vide.
+// Les abonnés sont attendus par publish() : l'envoi part avant la fin de la fonction serverless.
 export default async function notify(app) {
   const url = config.discord.webhookUrl;
   if (!url) return;
   const { db } = app;
 
-  function describe(event) {
+  async function describe(event) {
     const people = event.participants.length
-      ? db.prepare(`SELECT pseudo, discord_id FROM members WHERE id IN (${event.participants.map(() => '?').join(',')})`)
-          .all(...event.participants)
+      ? (await db.all(`SELECT pseudo, discord_id FROM members WHERE id IN (${event.participants.map(() => '?').join(',')})`, ...event.participants))
           .map((m) => (m.discord_id ? `<@${m.discord_id}>` : m.pseudo))
           .join(', ')
       : 'aucun';
@@ -35,7 +35,7 @@ export default async function notify(app) {
           embeds: [{
             title: `${prefix} ${name}`,
             url: week,
-            description: describe(event),
+            description: await describe(event),
             color,
             footer: { text: `par ${actor.pseudo}` },
           }],

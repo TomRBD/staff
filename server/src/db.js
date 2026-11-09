@@ -1,32 +1,78 @@
-import Database from 'better-sqlite3';
+import { createClient } from '@libsql/client';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config } from './config.js';
 
+// libSQL : fichier SQLite local (file:...) en dev/Docker, base Turso (libsql://...) sur Vercel.
 const migrationsDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'migrations');
 
-fs.mkdirSync(path.dirname(path.resolve(config.dbPath)), { recursive: true });
+if (config.db.url.startsWith('file:')) {
+  fs.mkdirSync(path.dirname(path.resolve(config.db.url.slice(5))), { recursive: true });
+}
 
-export const db = new Database(config.dbPath);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
-db.pragma('busy_timeout = 5000');
+export const client = createClient({ url: config.db.url, authToken: config.db.authToken });
 
-export function migrate(log = console) {
-  db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+const clean = (args) => args.map((a) => (a === undefined ? null : typeof a === 'boolean' ? Number(a) : a));
+const rowsOf = (rs) => rs.rows.map((r) => Object.fromEntries(rs.columns.map((c, i) => [c, r[i]])));
+const meta = (rs) => ({ changes: rs.rowsAffected, lastInsertRowid: Number(rs.lastInsertRowid ?? 0) });
+
+function wrap(ex) {
+  const exec = (sql, args) => ex.execute({ sql, args: clean(args) });
+  return {
+    all: async (sql, ...args) => rowsOf(await exec(sql, args)),
+    get: async (sql, ...args) => rowsOf(await exec(sql, args))[0],
+    run: async (sql, ...args) => meta(await exec(sql, args)),
+  };
+}
+
+export const db = {
+  ...wrap(client),
+  // Plusieurs écritures atomiques en un aller-retour : [[sql, ...args], ...]
+  async batch(stmts) {
+    const res = await client.batch(stmts.map(([sql, ...args]) => ({ sql, args: clean(args) })), 'write');
+    return res.map(meta);
+  },
+  // Transaction interactive (lectures + écritures dépendantes)
+  async tx(fn) {
+    const t = await client.transaction('write');
+    try {
+      const out = await fn(wrap(t));
+      await t.commit();
+      return out;
+    } catch (err) {
+      await t.rollback().catch(() => {});
+      throw err;
+    } finally {
+      t.close();
+    }
+  },
+};
+
+export const isConstraintError = (err) =>
+  /SQLITE_CONSTRAINT/.test(`${err?.code} ${err?.cause?.code} ${err?.message}`) || /UNIQUE constraint/i.test(err?.message || '');
+
+export async function migrate(log = console) {
+  await client.execute(`CREATE TABLE IF NOT EXISTS schema_migrations (
     name TEXT PRIMARY KEY,
     applied_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`);
-  const done = new Set(db.prepare('SELECT name FROM schema_migrations').all().map((r) => r.name));
+  const applied = async () => new Set((await db.all('SELECT name FROM schema_migrations')).map((r) => r.name));
+  const done = await applied();
   const files = fs.readdirSync(migrationsDir).filter((f) => f.endsWith('.sql')).sort();
   for (const file of files) {
     if (done.has(file)) continue;
     const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-    db.transaction(() => {
-      db.exec(sql);
-      db.prepare('INSERT INTO schema_migrations (name) VALUES (?)').run(file);
-    })();
-    log.info(`Migration appliquée : ${file}`);
+    try {
+      await client.executeMultiple(
+        `BEGIN;\n${sql}\n;INSERT INTO schema_migrations (name) VALUES ('${file.replace(/'/g, "''")}');\nCOMMIT;`
+      );
+      log.info(`Migration appliquée : ${file}`);
+    } catch (err) {
+      await client.execute('ROLLBACK').catch(() => {});
+      // Une autre instance l'a peut-être appliquée en même temps (démarrages à froid simultanés)
+      if ((await applied()).has(file)) continue;
+      throw err;
+    }
   }
 }

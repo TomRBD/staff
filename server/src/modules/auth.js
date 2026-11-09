@@ -76,25 +76,27 @@ export default async function auth(app) {
     }
 
     const displayName = user.global_name || user.username;
-    let member = db.prepare('SELECT * FROM members WHERE discord_id = ?').get(user.id);
+    let member = await db.get('SELECT * FROM members WHERE discord_id = ?', user.id);
     const isAdmin = config.adminIds.includes(user.id);
 
     if (!member) {
       let allowed = isAdmin;
       if (!allowed && config.discord.guildId) allowed = await hasGuildAccess(token, req.log);
       if (!allowed) return reply.redirect('/?error=not_allowed');
-      const info = db
-        .prepare('INSERT INTO members (discord_id, pseudo, avatar, role) VALUES (?, ?, ?, ?)')
-        .run(user.id, displayName, user.avatar, isAdmin ? 'admin' : 'member');
-      member = db.prepare('SELECT * FROM members WHERE id = ?').get(info.lastInsertRowid);
+      const info = await db.run(
+        'INSERT INTO members (discord_id, pseudo, avatar, role) VALUES (?, ?, ?, ?)',
+        user.id, displayName, user.avatar, isAdmin ? 'admin' : 'member'
+      );
+      member = await db.get('SELECT * FROM members WHERE id = ?', info.lastInsertRowid);
     }
 
     if (!member.active) return reply.redirect('/?error=not_allowed');
 
-    db.prepare(
+    await db.run(
       `UPDATE members SET avatar = ?, last_login = datetime('now'),
-       role = CASE WHEN ? THEN 'admin' ELSE role END WHERE id = ?`
-    ).run(user.avatar, isAdmin ? 1 : 0, member.id);
+       role = CASE WHEN ? THEN 'admin' ELSE role END WHERE id = ?`,
+      user.avatar, isAdmin ? 1 : 0, member.id
+    );
 
     openSession(reply, member);
     return reply.redirect('/');
@@ -118,10 +120,10 @@ export default async function auth(app) {
     app.log.warn('DEV_LOGIN actif : connexion sans Discord ouverte');
     app.get('/auth/dev', async (req, reply) => {
       const pseudo = String(req.query.pseudo || 'Dev').slice(0, 40);
-      let member = db.prepare('SELECT * FROM members WHERE pseudo = ?').get(pseudo);
+      let member = await db.get('SELECT * FROM members WHERE pseudo = ?', pseudo);
       if (!member) {
-        const info = db.prepare("INSERT INTO members (pseudo, role) VALUES (?, 'admin')").run(pseudo);
-        member = db.prepare('SELECT * FROM members WHERE id = ?').get(info.lastInsertRowid);
+        const info = await db.run("INSERT INTO members (pseudo, role) VALUES (?, 'admin')", pseudo);
+        member = await db.get('SELECT * FROM members WHERE id = ?', info.lastInsertRowid);
       }
       openSession(reply, member);
       return reply.redirect('/');

@@ -1,7 +1,7 @@
 # Staff Planner
 
 Planning d'équipe fait maison : dispos de chaque membre, vue d'équipe, planning de la semaine.
-Node 20 + Fastify + SQLite côté serveur, React + Vite côté front, connexion Discord, un seul conteneur Docker.
+Node 22 + Fastify + libSQL (SQLite) côté serveur, React + Vite côté front, connexion Discord. Déployable sur Vercel (base Turso) ou en conteneur Docker (fichier SQLite).
 
 ## Fonctionnalités
 
@@ -21,41 +21,40 @@ Node 20 + Fastify + SQLite côté serveur, React + Vite côté front, connexion 
 3. OAuth2 > Redirects : ajouter `https://ton-domaine/api/auth/callback` (et `http://localhost:5173/api/auth/callback` pour le dev).
 4. Ton ID Discord (mode développeur activé, clic droit sur ton profil, Copier l'identifiant) va dans `ADMIN_DISCORD_IDS`.
 
-## 2. Déployer sur le VPS
+## 2. Déployer sur Vercel
+
+Architecture : le front (`web/dist`) est servi par le CDN Vercel, l'API Fastify tourne dans une fonction serverless (`api/index.js`, toutes les routes `/api/*`), la base est une base Turso (SQLite managé). Les migrations s'appliquent au premier appel de chaque instance.
+
+1. **Base Turso** : créer un compte sur turso.tech, une base en Europe, puis récupérer son URL `libsql://...` et un jeton. Ou, dans Vercel : Storage > Turso, qui pose `TURSO_DATABASE_URL` et `TURSO_AUTH_TOKEN` tout seul.
+2. **Projet Vercel** : Add New > Project > importer le repo GitHub. Laisser Root Directory à la racine, tout le reste est dans `vercel.json`.
+3. **Variables d'environnement** (Settings > Environment Variables) : `DATABASE_URL`, `DATABASE_AUTH_TOKEN` (si pas d'intégration), `JWT_SECRET`, `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, `ADMIN_DISCORD_IDS`, et les optionnelles. `PUBLIC_URL` seulement avec un domaine perso.
+4. **Discord** : ajouter `https://<projet>.vercel.app/api/auth/callback` dans OAuth2 > Redirects.
+5. Deploy. Chaque push sur `main` redéploie.
+
+Les déploiements de preview ont une autre URL : la connexion Discord n'y marche pas (redirect non déclaré), c'est normal.
+
+## 2 bis. Déployer en Docker (VPS)
 
 ```bash
-cp .env.example .env
-openssl rand -hex 32          # à coller dans JWT_SECRET
-nano .env                     # PUBLIC_URL, DISCORD_*, ADMIN_DISCORD_IDS
+cp .env.example .env    # DATABASE_URL reste un fichier, forcé à /data/planner.db dans l'image
+openssl rand -hex 32    # à coller dans JWT_SECRET
 docker compose up -d --build
 ```
 
-Le conteneur écoute sur `127.0.0.1:3000`. Mettre un reverse proxy HTTPS devant, par exemple Caddy :
-
-```
-planning.example.com {
-    reverse_proxy 127.0.0.1:3000
-}
-```
-
-La base SQLite vit dans le volume `planner-data`. Les migrations s'appliquent seules au démarrage.
-
-Sauvegarde à chaud :
-
-```bash
-docker compose exec planner node -e "new (require('better-sqlite3'))('/data/planner.db').backup('/data/backup.db').then(()=>console.log('ok'))"
-docker compose cp planner:/data/backup.db ./backup-$(date +%F).db
-```
+Le conteneur écoute sur `127.0.0.1:3000`, à mettre derrière un reverse proxy HTTPS (Caddy : `reverse_proxy 127.0.0.1:3000`). La base vit dans le volume `planner-data`.
 
 ## 3. Développer en local
 
 ```bash
-cp .env.example .env    # PUBLIC_URL=http://localhost:5173, JWT_SECRET, DEV_LOGIN=1
-cd server && npm install && npm run dev      # API sur :3000
-cd web && npm install && npm run dev         # front sur :5173, proxy /api vers :3000
+cp .env.example .env              # JWT_SECRET, DEV_LOGIN=1
+npm install && npm install --prefix web
+npm run dev:api                   # API sur :3000 (terminal 1)
+npm run dev:web                   # front sur :5173, proxy /api vers :3000 (terminal 2)
 ```
 
-Avec `DEV_LOGIN=1` (jamais en production), `http://localhost:5173/api/auth/dev?pseudo=Tom` connecte sans Discord en admin.
+Avec `DEV_LOGIN=1` (ignoré sur Vercel), `http://localhost:5173/api/auth/dev?pseudo=Tom` connecte sans Discord en admin.
+
+`npm run migrate` applique les migrations sur la base pointée par `DATABASE_URL` (pratique pour préparer Turso avant le premier déploiement).
 
 ## Ajouter une fonctionnalité
 
@@ -65,9 +64,9 @@ Le code est découpé en modules, une fonctionnalité = un module serveur + une 
 
 1. `server/src/modules/ma-feature.js` exporte un plugin Fastify (`export default async function (app) { ... }`).
 2. L'ajouter dans `server/src/modules/index.js` : ses routes sont servies sous `/api`.
-3. Protéger les routes avec `preHandler: app.authenticate` (ou `[app.authenticate, app.requireAdmin]`). Le membre connecté est dans `req.member`, la base dans `app.db`.
+3. Protéger les routes avec `preHandler: app.authenticate` (ou `[app.authenticate, app.requireAdmin]`). Le membre connecté est dans `req.member`, la base dans `app.db` (async : `await db.all / get / run(sql, ...args)`, `db.batch([[sql, ...args]])` pour plusieurs écritures atomiques, `db.tx(async (q) => ...)` pour une transaction). Les clés étrangères ne sont pas garanties côté Turso : faire les suppressions en cascade explicitement.
 4. Nouvelles tables : `server/migrations/002_ma_feature.sql`. Appliquée une seule fois au prochain démarrage.
-5. Réagir aux événements sans toucher au module planning : `bus.on('event.created', ({ event, actor }) => ...)` (voir `notify.js`). Événements publiés : `event.created`, `event.updated`, `event.deleted`.
+5. Réagir aux événements sans toucher au module planning : `bus.on('event.created', async ({ event, actor }) => ...)` (voir `notify.js`). Publier avec `await publish(...)` : en serverless, rien ne tourne après la réponse. Événements publiés : `event.created`, `event.updated`, `event.deleted`.
 
 **Front**
 
@@ -80,7 +79,7 @@ Le code est découpé en modules, une fonctionnalité = un module serveur + une 
 - Session en cookie `HttpOnly`, `SameSite=Lax`, `Secure` dès que `PUBLIC_URL` est en https, JWT signé 30 jours.
 - `state` OAuth signé contre le CSRF de connexion ; toute écriture API exige l'en-tête `X-Requested-With: staff-planner`.
 - Le membre est relu en base à chaque requête : désactiver un compte coupe l'accès immédiatement.
-- Validation JSON Schema sur toutes les entrées, requêtes SQL préparées, conteneur en utilisateur non root.
+- Validation JSON Schema sur toutes les entrées, requêtes SQL paramétrées, conteneur en utilisateur non root.
 
 ## Pistes
 

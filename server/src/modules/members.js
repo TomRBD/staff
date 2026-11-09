@@ -1,3 +1,4 @@
+import { isConstraintError } from '../db.js';
 import { colorSchema, httpError, publicMember } from '../lib/http.js';
 
 const fields = {
@@ -14,20 +15,18 @@ export default async function members(app) {
 
   const full = (m) => ({ ...publicMember(m), discord_id: m.discord_id, active: !!m.active, last_login: m.last_login });
 
-  const run = (fn) => {
+  const run = async (fn) => {
     try {
-      return fn();
+      return await fn();
     } catch (err) {
-      if (String(err.code).startsWith('SQLITE_CONSTRAINT')) throw httpError(409, 'Cet ID Discord est déjà utilisé');
+      if (isConstraintError(err)) throw httpError(409, 'Cet ID Discord est déjà utilisé');
       throw err;
     }
   };
 
   app.get('/members', { preHandler: app.authenticate }, async (req) => {
     const all = req.query.all === '1' && req.member.role === 'admin';
-    const rows = db
-      .prepare(`SELECT * FROM members ${all ? '' : 'WHERE active = 1'} ORDER BY pseudo COLLATE NOCASE`)
-      .all();
+    const rows = await db.all(`SELECT * FROM members ${all ? '' : 'WHERE active = 1'} ORDER BY pseudo COLLATE NOCASE`);
     return rows.map(all ? full : publicMember);
   });
 
@@ -36,12 +35,14 @@ export default async function members(app) {
     schema: { body: { type: 'object', required: ['pseudo'], properties: fields, additionalProperties: false } },
   }, async (req, reply) => {
     const b = req.body;
-    const info = run(() =>
-      db.prepare('INSERT INTO members (pseudo, discord_id, role, color) VALUES (?, ?, ?, ?)')
-        .run(b.pseudo.trim(), b.discord_id || null, b.role || 'member', b.color || '#5865F2')
+    const info = await run(() =>
+      db.run(
+        'INSERT INTO members (pseudo, discord_id, role, color) VALUES (?, ?, ?, ?)',
+        b.pseudo.trim(), b.discord_id || null, b.role || 'member', b.color || '#5865F2'
+      )
     );
     reply.code(201);
-    return full(db.prepare('SELECT * FROM members WHERE id = ?').get(info.lastInsertRowid));
+    return full(await db.get('SELECT * FROM members WHERE id = ?', info.lastInsertRowid));
   });
 
   app.patch('/members/:id', {
@@ -49,7 +50,7 @@ export default async function members(app) {
     schema: { body: { type: 'object', properties: fields, additionalProperties: false } },
   }, async (req) => {
     const id = Number(req.params.id);
-    const m = db.prepare('SELECT * FROM members WHERE id = ?').get(id);
+    const m = await db.get('SELECT * FROM members WHERE id = ?', id);
     if (!m) throw httpError(404, 'Membre introuvable');
     const b = req.body;
     if (id === req.member.id && (b.role === 'member' || b.active === false)) {
@@ -62,18 +63,26 @@ export default async function members(app) {
       color: b.color ?? m.color,
       active: b.active === undefined ? m.active : b.active ? 1 : 0,
     };
-    run(() =>
-      db.prepare('UPDATE members SET pseudo=?, discord_id=?, role=?, color=?, active=? WHERE id=?')
-        .run(next.pseudo, next.discord_id, next.role, next.color, next.active, id)
+    await run(() =>
+      db.run(
+        'UPDATE members SET pseudo=?, discord_id=?, role=?, color=?, active=? WHERE id=?',
+        next.pseudo, next.discord_id, next.role, next.color, next.active, id
+      )
     );
-    return full(db.prepare('SELECT * FROM members WHERE id = ?').get(id));
+    return full(await db.get('SELECT * FROM members WHERE id = ?', id));
   });
 
+  // Suppressions en cascade explicites : ne dépend pas de PRAGMA foreign_keys (non persistant sur Turso)
   app.delete('/members/:id', admin, async (req, reply) => {
     const id = Number(req.params.id);
     if (id === req.member.id) throw httpError(400, 'Tu ne peux pas te supprimer toi-même');
-    const info = db.prepare('DELETE FROM members WHERE id = ?').run(id);
-    if (!info.changes) throw httpError(404, 'Membre introuvable');
+    const res = await db.batch([
+      ['DELETE FROM availability WHERE member_id = ?', id],
+      ['DELETE FROM event_participants WHERE member_id = ?', id],
+      ['UPDATE events SET created_by = NULL WHERE created_by = ?', id],
+      ['DELETE FROM members WHERE id = ?', id],
+    ]);
+    if (!res[3].changes) throw httpError(404, 'Membre introuvable');
     return reply.code(204).send();
   });
 }
